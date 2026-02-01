@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable, UnauthorizedException } from '@nestjs/common';
+import { BadRequestException, ForbiddenException, Injectable, UnauthorizedException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import * as bcrypt from 'bcrypt';
 import { JwtService } from '@nestjs/jwt';
@@ -197,6 +197,203 @@ export class AuthService {
     async logout(userId: string, tenantId: string) {
         const key = `refresh:${userId}:${tenantId}`;
         await this.redis.getClient().del(key);
+        return { success: true };
+    }
+
+    async getUser(userId: string) {
+        const user = await this.prisma.user.findUnique({ where: { id: userId } });
+        if (!user) throw new UnauthorizedException('User not found');
+        return user;
+    }
+
+    async getTenant(tenantId: string) {
+        const tenant = await this.prisma.tenant.findUnique({ where: { id: tenantId } });
+        if (!tenant) throw new UnauthorizedException('Tenant not found');
+        return tenant;
+    }
+
+    // Invite user to tenant (create user if doesn't exist, create membership)
+    async inviteUserToTenant(tenantId: string, email: string, roleId?: string) {
+        // Check if user exists
+        let user = await this.prisma.user.findUnique({ where: { email } });
+
+        if (!user) {
+            // Create user with temporary password (user will need to reset)
+            const tempPassword = Math.random().toString(36).slice(-12) + Math.random().toString(36).slice(-12);
+            const passwordHash = await this.hashPassword(tempPassword);
+            user = await this.prisma.user.create({
+                data: { email, passwordHash },
+            });
+        }
+
+        // Check if membership already exists
+        const existingMembership = await this.prisma.tenantUser.findFirst({
+            where: { userId: user.id, tenantId },
+        });
+
+        if (existingMembership) {
+            throw new BadRequestException('User is already a member of this tenant');
+        }
+
+        // Create membership
+        const membership = await this.prisma.tenantUser.create({
+            data: {
+                tenantId,
+                userId: user.id,
+                status: 'INVITED',
+            },
+        });
+
+        // Assign role if provided
+        if (roleId) {
+            const role = await this.prisma.role.findUnique({
+                where: { id: roleId },
+                select: { id: true, tenantId: true },
+            });
+
+            if (!role) throw new BadRequestException('Role not found');
+            if (role.tenantId !== tenantId) throw new BadRequestException('Role belongs to another tenant');
+
+            await this.prisma.tenantUserRole.create({
+                data: {
+                    tenantUserId: membership.id,
+                    roleId,
+                },
+            });
+        }
+
+        return {
+            userId: user.id,
+            email: user.email,
+            membershipId: membership.id,
+            status: membership.status,
+        };
+    }
+
+    // List tenant users
+    async listTenantUsers(tenantId: string) {
+        const memberships = await this.prisma.tenantUser.findMany({
+            where: { tenantId },
+            include: {
+                user: {
+                    select: {
+                        id: true,
+                        email: true,
+                        isActive: true,
+                        createdAt: true,
+                    },
+                },
+                roles: {
+                    include: {
+                        role: {
+                            select: {
+                                id: true,
+                                name: true,
+                                description: true,
+                            },
+                        },
+                    },
+                },
+            },
+            orderBy: { createdAt: 'desc' },
+        });
+
+        return memberships.map((m) => ({
+            membershipId: m.id,
+            userId: m.user.id,
+            email: m.user.email,
+            isActive: m.user.isActive,
+            status: m.status,
+            roles: m.roles.map((ur) => ({
+                id: ur.role.id,
+                name: ur.role.name,
+                description: ur.role.description,
+            })),
+            createdAt: m.createdAt,
+        }));
+    }
+
+    // Get user's pending invitations
+    async getUserInvitations(userId: string) {
+        const memberships = await this.prisma.tenantUser.findMany({
+            where: {
+                userId,
+                status: 'INVITED',
+            },
+            include: {
+                tenant: {
+                    select: {
+                        id: true,
+                        name: true,
+                        slug: true,
+                    },
+                },
+                roles: {
+                    include: {
+                        role: {
+                            select: {
+                                id: true,
+                                name: true,
+                                description: true,
+                            },
+                        },
+                    },
+                },
+            },
+            orderBy: { createdAt: 'desc' },
+        });
+
+        return memberships.map((m) => ({
+            membershipId: m.id,
+            tenantId: m.tenant.id,
+            tenantName: m.tenant.name,
+            tenantSlug: m.tenant.slug,
+            roles: m.roles.map((ur) => ({
+                id: ur.role.id,
+                name: ur.role.name,
+                description: ur.role.description,
+            })),
+            createdAt: m.createdAt,
+        }));
+    }
+
+    // Accept invitation
+    async acceptInvitation(userId: string, membershipId: string) {
+        const membership = await this.prisma.tenantUser.findUnique({
+            where: { id: membershipId },
+            include: { tenant: true },
+        });
+
+        if (!membership) throw new BadRequestException('Invitation not found');
+        if (membership.userId !== userId) throw new ForbiddenException('Not your invitation');
+        if (membership.status !== 'INVITED') throw new BadRequestException('Invitation already processed');
+
+        await this.prisma.tenantUser.update({
+            where: { id: membershipId },
+            data: { status: 'ACTIVE' },
+        });
+
+        return {
+            success: true,
+            tenantId: membership.tenantId,
+            tenantName: membership.tenant.name,
+        };
+    }
+
+    // Decline invitation
+    async declineInvitation(userId: string, membershipId: string) {
+        const membership = await this.prisma.tenantUser.findUnique({
+            where: { id: membershipId },
+        });
+
+        if (!membership) throw new BadRequestException('Invitation not found');
+        if (membership.userId !== userId) throw new ForbiddenException('Not your invitation');
+        if (membership.status !== 'INVITED') throw new BadRequestException('Invitation already processed');
+
+        await this.prisma.tenantUser.delete({
+            where: { id: membershipId },
+        });
+
         return { success: true };
     }
 }

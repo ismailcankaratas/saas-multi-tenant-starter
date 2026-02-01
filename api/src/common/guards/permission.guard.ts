@@ -22,6 +22,11 @@ export class PermissionGuard implements CanActivate {
         const request = context.switchToHttp().getRequest();
         const user = request.user;
 
+        // OWNER rolüne sahip kullanıcılar tüm izinlere sahiptir
+        if (user?.roles?.includes('OWNER')) {
+            return true;
+        }
+
         if (!user?.permissions?.includes(requiredPermission)) {
             throw new ForbiddenException('Permission denied');
         }
